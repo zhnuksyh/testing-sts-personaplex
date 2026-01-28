@@ -7,8 +7,8 @@ export default defineConfig({
     server: {
         host: true,
         https: {
-            key: './key.pem',
-            cert: './cert.pem'
+            key: './certs/key.pem',
+            cert: './certs/cert.pem'
         }
     }
 })
