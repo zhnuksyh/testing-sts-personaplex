@@ -9,6 +9,7 @@ export const usePersonaAudio = () => {
     // State
     const [isConnected, setIsConnected] = useState(false);
     const [isRecording, setIsRecording] = useState(false);
+    const [error, setError] = useState<string | null>(null);
     const [inputVolume, setInputVolume] = useState(0);
     const [outputVolume, setOutputVolume] = useState(0);
 
@@ -23,14 +24,7 @@ export const usePersonaAudio = () => {
 
     // --- AUDIO HELPERS ---
 
-    const convertFloat32ToInt16 = (float32Array: Float32Array): Int16Array => {
-        const int16Array = new Int16Array(float32Array.length);
-        for (let i = 0; i < float32Array.length; i++) {
-            let s = Math.max(-1, Math.min(1, float32Array[i]));
-            int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        }
-        return int16Array;
-    };
+
 
     const playAudioChunk = (ctx: AudioContext, float32Data: Float32Array) => {
         const buffer = ctx.createBuffer(1, float32Data.length, 24000);
@@ -66,6 +60,13 @@ export const usePersonaAudio = () => {
             return ctx;
         } catch (err) {
             console.error("Audio Init Error:", err);
+            // Check for Secure Context issue
+            if (!window.isSecureContext) {
+                setError("Audio Error: HTTPS or Localhost required.");
+                alert("Microphone access requires HTTPS or localhost. It will not work on http://192.168.x.x");
+            } else {
+                setError("Audio Init Failed");
+            }
             return null;
         }
     };
@@ -118,6 +119,7 @@ export const usePersonaAudio = () => {
         if (!ctx) return;
 
         const ws = new WebSocket(url);
+        setError(null);
 
         ws.onopen = () => {
             console.log("Connected to PersonaPlex Backend");
@@ -150,6 +152,7 @@ export const usePersonaAudio = () => {
 
         ws.onerror = (e) => {
             console.error("WebSocket Error:", e);
+            setError("Connection Failed. Check URL/Firewall.");
             handleDisconnect();
         }
 
@@ -199,9 +202,9 @@ export const usePersonaAudio = () => {
 
             workletNode.current.port.onmessage = (event) => {
                 if (socket.current?.readyState === WebSocket.OPEN) {
-                    const pcmData = event.data;
-                    const int16Data = convertFloat32ToInt16(pcmData);
-                    socket.current.send(int16Data);
+                    const pcmData = event.data; // Float32Array
+                    // Send as Float32 directly to match backend expectation
+                    socket.current.send(pcmData);
                 }
             };
 
@@ -226,6 +229,7 @@ export const usePersonaAudio = () => {
         isRecording,
         inputVolume,
         outputVolume,
+        error,
         connect,
         disconnect,
         startMic,
