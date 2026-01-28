@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+websockets
+numpy
+torch
+torchaudio
+huggingface-hub
+moshi
