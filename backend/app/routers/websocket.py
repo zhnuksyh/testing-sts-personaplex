@@ -26,6 +26,9 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("Client Connected via WebSocket")
     
+    # NEW: Reset engine state for new session (Clear buffer & history)
+    engine.reset()
+    
     try:
         while True:
             # 1. AWAIT INPUT
