@@ -6,7 +6,7 @@ import { VisualizerStage } from './components/VisualizerStage';
 
 function App() {
     // Local UI State
-    const [serverUrl, setServerUrl] = useState('ws://localhost:8000/ws');
+    const [serverUrl, setServerUrl] = useState(`wss://${window.location.hostname}:8000/ws`);
     const [persona, setPersona] = useState("You are a helpful, witty AI assistant named Plex.");
     const [voiceId, setVoiceId] = useState("natural_female_1");
 
@@ -16,6 +16,7 @@ function App() {
         isRecording,
         inputVolume,
         outputVolume,
+        error,
         connect,
         disconnect,
         startMic,
@@ -65,6 +66,7 @@ function App() {
                     setServerUrl={setServerUrl}
                     isConnected={isConnected}
                     toggleConnection={handleToggleConnection}
+                    error={error}
                 />
 
                 <SettingsCard

@@ -6,13 +6,15 @@ interface ConnectionCardProps {
     setServerUrl: (url: string) => void;
     isConnected: boolean;
     toggleConnection: () => void;
+    error: string | null;
 }
 
 export const ConnectionCard: React.FC<ConnectionCardProps> = ({
     serverUrl,
     setServerUrl,
     isConnected,
-    toggleConnection
+    toggleConnection,
+    error
 }) => {
     return (
         <div className="bg-slate-800 rounded-xl p-6 border border-slate-700 shadow-xl">
@@ -43,6 +45,14 @@ export const ConnectionCard: React.FC<ConnectionCardProps> = ({
                     {isConnected ? 'Terminate Link' : 'Initialize Connection'}
                 </button>
             </div>
-        </div>
+
+            {
+                error && (
+                    <div className="mt-4 p-3 bg-red-900/50 border border-red-700/50 rounded-lg text-red-200 text-xs text-center">
+                        {error}
+                    </div>
+                )
+            }
+        </div >
     );
 };
