@@ -53,11 +53,11 @@ export const VisualizerStage: React.FC<VisualizerStageProps> = ({
                         disabled={!isConnected}
                         onClick={toggleMic}
                         className={`p-6 rounded-full transition-all duration-300 transform hover:scale-105 shadow-2xl ${isRecording
-                            ? 'bg-red-500 hover:bg-red-600 text-white shadow-red-500/30'
-                            : 'bg-slate-700 hover:bg-slate-600 text-slate-300'
+                            ? 'bg-green-500 hover:bg-green-600 text-white shadow-green-500/30'
+                            : 'bg-red-500 hover:bg-red-600 text-white shadow-red-500/30'
                             } disabled:opacity-50 disabled:cursor-not-allowed`}
                     >
-                        {isRecording ? <MicOff className="w-8 h-8" /> : <Mic className="w-8 h-8" />}
+                        {isRecording ? <Mic className="w-8 h-8" /> : <MicOff className="w-8 h-8" />}
                     </button>
                 </div>
 
