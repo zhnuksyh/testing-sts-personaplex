@@ -5,4 +5,5 @@ numpy
 torch
 torchaudio
 huggingface-hub
-moshi
+moshi-personaplex>=0.1.0
+sentencepiece
