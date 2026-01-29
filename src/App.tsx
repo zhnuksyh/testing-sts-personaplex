@@ -7,8 +7,8 @@ import { VisualizerStage } from './components/VisualizerStage';
 function App() {
     // Local UI State
     const [serverUrl, setServerUrl] = useState(`wss://${window.location.hostname}:8000/ws`);
-    const [persona, setPersona] = useState("You are a helpful, witty AI assistant named Plex.");
-    const [voiceId, setVoiceId] = useState("natural_female_1");
+    const [persona, setPersona] = useState("You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way.");
+    const [voiceId, setVoiceId] = useState("NATF0");
 
     // Audio Hook
     const {

@@ -1,9 +1,12 @@
 
 import logging
 import os
+import tarfile
+from pathlib import Path
 import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
+import sentencepiece
 
 try:
     from moshi.models import loaders, LMGen
@@ -19,6 +22,14 @@ from backend.app.core.config import SAMPLE_RATE, CHUNK_SIZE, DEVICE, HF_TOKEN
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PersonaPlex-Engine")
+
+# PersonaPlex voice options
+PERSONAPLEX_VOICES = [
+    "NATF0", "NATF1", "NATF2", "NATF3",  # Natural Female
+    "NATM0", "NATM1", "NATM2", "NATM3",  # Natural Male
+    "VARF0", "VARF1", "VARF2", "VARF3", "VARF4",  # Variety Female
+    "VARM0", "VARM1", "VARM2", "VARM3", "VARM4",  # Variety Male
+]
 
 
 class PersonaPlexWrapper:
@@ -74,11 +85,41 @@ class PersonaPlexWrapper:
         self.mimi.streaming_forever(batch_size=1)
         self.lm_gen.streaming_forever(batch_size=1)
         
-        # Voice prompt state
+        # Load text tokenizer for persona prompts
+        logger.info("Loading text tokenizer...")
+        tokenizer_path = hf_hub_download(
+            repo_id=self.repo_id,
+            filename=loaders.TEXT_TOKENIZER_NAME,
+            token=HF_TOKEN
+        )
+        self.text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_path)
+        
+        # Download and extract voice prompts
+        logger.info("Loading voice prompts...")
+        self.voice_prompt_dir = self._get_voice_prompt_dir()
+        
+        # State
         self.current_voice_prompt = None
-        self.voice_prompt_dir = None
+        self.current_text_prompt = None
         
         logger.info("PersonaPlex loaded successfully!")
+    
+    def _get_voice_prompt_dir(self) -> str:
+        """Download and extract voice prompts from HuggingFace."""
+        voices_tgz = hf_hub_download(
+            repo_id=self.repo_id,
+            filename="voices.tgz",
+            token=HF_TOKEN
+        )
+        voices_tgz = Path(voices_tgz)
+        voices_dir = voices_tgz.parent / "voices"
+        
+        if not voices_dir.exists():
+            logger.info(f"Extracting voice prompts to {voices_dir}...")
+            with tarfile.open(voices_tgz, "r:gz") as tar:
+                tar.extractall(path=voices_tgz.parent)
+        
+        return str(voices_dir)
     
     def set_voice_prompt_dir(self, voice_prompt_dir: str):
         """Set the directory containing voice prompt embeddings."""
@@ -197,12 +238,20 @@ class PersonaPlexEngine:
 
     def configure(self, persona: str, voice_id: str):
         """Configure the persona and voice for the session."""
-        if self.wrapper is not None:
-            # Voice prompt loading would require voice prompt directory
-            # For now, just log the configuration
-            logger.info(f"Configured persona: {persona[:50]}..., voice: {voice_id}")
-            # TODO: Implement voice prompt loading when voice files are available
-            # self.wrapper.load_voice_prompt(voice_id)
+        if self.wrapper is None:
+            return
+        
+        # Apply voice prompt
+        if voice_id and voice_id in PERSONAPLEX_VOICES:
+            self.wrapper.load_voice_prompt(voice_id)
+        else:
+            logger.warning(f"Unknown voice ID: {voice_id}. Using default.")
+        
+        # Apply text prompt (persona)
+        if persona:
+            self.wrapper.set_text_prompt(persona, self.wrapper.text_tokenizer)
+        
+        logger.info(f"Configured persona: {persona[:50] if persona else 'default'}..., voice: {voice_id}")
 
     def process_audio_frame(self, audio_frame: bytes) -> bytes:
         """
