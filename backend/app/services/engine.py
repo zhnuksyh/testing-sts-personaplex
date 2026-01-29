@@ -1,214 +1,273 @@
 
 import logging
-import time
+import os
 import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
-try:
-    import moshi
-    import moshi.models.loaders
-    from moshi.models.lm import LMModel
-except ImportError:
-    moshi = None
 
-from backend.app.core.config import CHUNK_SIZE, MODEL_TYPE, DEVICE
+try:
+    from moshi.models import loaders, LMGen
+    from moshi.models.compression import MimiModel
+    from moshi.models.lm import LMModel
+    MOSHI_AVAILABLE = True
+except ImportError:
+    MOSHI_AVAILABLE = False
+    loaders = None
+    LMGen = None
+
+from backend.app.core.config import SAMPLE_RATE, CHUNK_SIZE, DEVICE, HF_TOKEN
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PersonaPlex-Engine")
 
-class MoshiWrapper:
-    def __init__(self):
-        self.device = DEVICE
-        # Use Moshiko (Kyutai) as the stable base model due to architecture mismatches 
-        # with the current installed 'moshi' library and the NVIDIA checkpoint keys.
-        self.repo_id = "kyutai/moshiko-pytorch-bf16"
+
+class PersonaPlexWrapper:
+    """
+    Wrapper for NVIDIA PersonaPlex-7B model.
+    Uses official moshi-personaplex loaders for proper model initialization.
+    """
+    
+    def __init__(self, device: str = "cuda", cpu_offload: bool = False):
+        self.device = torch.device(device)
+        self.repo_id = loaders.DEFAULT_REPO  # nvidia/personaplex-7b-v1
         
-        logger.info(f"Loading Moshi Tokenizer (Mimi) from {self.repo_id}...")
-        # Specific checkpoint that works with current library
-        mimi_weight = hf_hub_download(repo_id=self.repo_id, filename="tokenizer-e351c8d8-checkpoint125.safetensors")
-        self.mimi = moshi.models.loaders.get_mimi(mimi_weight, device=self.device)
-        self.mimi.to(self.device)
+        logger.info(f"Loading PersonaPlex from {self.repo_id}...")
+        
+        # Download and load Mimi (Neural Audio Codec)
+        logger.info("Loading Mimi tokenizer...")
+        mimi_weight = hf_hub_download(
+            repo_id=self.repo_id, 
+            filename=loaders.MIMI_NAME,
+            token=HF_TOKEN
+        )
+        self.mimi = loaders.get_mimi(mimi_weight, device=self.device)
         self.mimi.eval()
         
-        # Determine strict buffering rule from Mimi
-        # Frame size is typically 1920 for 24kHz (80ms)
-        self.frame_size = 1920 
+        # Frame size from Mimi config (24kHz / 12.5Hz = 1920 samples)
+        self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
+        logger.info(f"Mimi loaded. Frame size: {self.frame_size}, Sample rate: {self.mimi.sample_rate}")
         
-        logger.info(f"Loading Moshi LM from {self.repo_id}...")
-        lm_weight = hf_hub_download(repo_id=self.repo_id, filename="model.safetensors")
-        self.lm = moshi.models.loaders.get_moshi_lm(lm_weight, device=self.device)
-        self.lm.to(self.device)
+        # Download and load LM (Language Model - the "brain")
+        logger.info("Loading PersonaPlex LM...")
+        lm_weight = hf_hub_download(
+            repo_id=self.repo_id, 
+            filename=loaders.MOSHI_NAME,
+            token=HF_TOKEN
+        )
+        self.lm = loaders.get_moshi_lm(
+            lm_weight, 
+            device=self.device,
+            cpu_offload=cpu_offload
+        )
         self.lm.eval()
         
-        self.lm_gen = moshi.models.LMGen(self.lm)
+        # Create LMGen for streaming inference with voice/text prompt support
+        self.lm_gen = LMGen(
+            self.lm,
+            audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),  # 0.5s of silence threshold
+            sample_rate=self.mimi.sample_rate,
+            device=self.device,
+            frame_rate=self.mimi.frame_rate,
+        )
         
-        # Enter streaming context permanently
-        self.streaming_ctx = self.mimi.streaming(batch_size=1)
-        self.streaming_ctx.__enter__()
+        # Enter streaming mode
+        self.mimi.streaming_forever(batch_size=1)
+        self.lm_gen.streaming_forever(batch_size=1)
         
-        self.lm_gen_ctx = self.lm_gen.streaming(batch_size=1)
-        self.lm_gen_ctx.__enter__()
+        # Voice prompt state
+        self.current_voice_prompt = None
+        self.voice_prompt_dir = None
         
-        logger.info("MoshiWrapper initialized successfully.")
-
+        logger.info("PersonaPlex loaded successfully!")
+    
+    def set_voice_prompt_dir(self, voice_prompt_dir: str):
+        """Set the directory containing voice prompt embeddings."""
+        self.voice_prompt_dir = voice_prompt_dir
+    
+    def load_voice_prompt(self, voice_name: str):
+        """Load a voice prompt embedding file (e.g., NATF0.pt, NATM1.pt)."""
+        if self.voice_prompt_dir is None:
+            logger.warning("Voice prompt directory not set. Skipping voice prompt.")
+            return
+        
+        voice_path = os.path.join(self.voice_prompt_dir, f"{voice_name}.pt")
+        if os.path.exists(voice_path):
+            self.lm_gen.load_voice_prompt_embeddings(voice_path)
+            self.current_voice_prompt = voice_name
+            logger.info(f"Loaded voice prompt: {voice_name}")
+        else:
+            logger.warning(f"Voice prompt not found: {voice_path}")
+    
+    def set_text_prompt(self, text_prompt: str, tokenizer=None):
+        """Set the text prompt (persona) for the model."""
+        if tokenizer is not None:
+            # Wrap with system tags as model expects
+            cleaned = text_prompt.strip()
+            if not (cleaned.startswith("<system>") and cleaned.endswith("<system>")):
+                text_prompt = f"<system> {cleaned} <system>"
+            self.lm_gen.text_prompt_tokens = tokenizer.encode(text_prompt)
+            logger.info(f"Set text prompt: {text_prompt[:50]}...")
+        else:
+            logger.warning("No tokenizer provided. Text prompts require a tokenizer.")
+    
     def process(self, audio_tensor: torch.Tensor) -> torch.Tensor | None:
-        # audio_tensor: [B, C, T]
+        """
+        Process a single frame of audio through the PersonaPlex pipeline.
+        
+        Args:
+            audio_tensor: [1, 1, frame_size] float32 tensor
+            
+        Returns:
+            Output audio tensor or None if still buffering
+        """
         with torch.no_grad():
+            # Encode user audio to acoustic tokens
             codes = self.mimi.encode(audio_tensor)
-            # codes: [B, num_codebooks, T_frames]
+            # codes: [1, 8, T_frames]
             
-            # SAFETY: Clamp codes to LM vocabulary size (likely 2048)
-            # Moshi/Mimi sometimes output 2048 as a special token or padding, 
-            # which might be out of bounds for the LM embedding.
-            # logger.info(f"Codes min: {codes.min()}, max: {codes.max()}")
-            codes = torch.clamp(codes, min=0, max=2047)
-            
-            tokens_out = self.lm_gen.step(codes)
-            if tokens_out is None:
-                return None
-            
-            # MEANINGFUL FIX: Clamp LM output tokens too
-            # If LM predicts > 2047, Mimi decode might crash
-            # tokens_out = torch.clamp(tokens_out, min=0, max=2047)
-            
-            # Check shape
-            # Expected: [B, 16, 1]. 
-            # Channel 0: Text. Channel 1-8: Audio. Channel 9-15: Input.
-            # Check shape
-            # Expected: [B, 16, 1]. 
-            # Channel 0: Text. Channel 1-8: Audio. Channel 9-15: Input.
-            # logger.info(f"Step out shape: {tokens_out.shape}")
-            # logger.info(f"Chan 0 (Text): {tokens_out[0,0,0]}, Chan 1 (Audio): {tokens_out[0,1,0]}")
-
-            # Correct Slicing: Skip Channel 0 (Text), Take Channels 1-8 (Audio)
-            if tokens_out.shape[1] >= 9:
-                audio_tokens = tokens_out[:, 1:9, :]
-            else:
-                # Fallback if shape is weird
-                audio_tokens = tokens_out[:, :8, :]
-            
-            # Clamp ONLY audio tokens for Mimi
-            audio_tokens = torch.clamp(audio_tokens, min=0, max=2047)
+            # Step through each time step
+            output_audio = None
+            for c in range(codes.shape[-1]):
+                tokens = self.lm_gen.step(codes[:, :, c:c+1])
+                if tokens is None:
+                    continue
                 
-            audio_out = self.mimi.decode(audio_tokens)
-            return audio_out
-
-    def close(self):
-        if self.streaming_ctx:
-            self.streaming_ctx.__exit__(None, None, None)
-        if self.lm_gen_ctx:
-            self.lm_gen_ctx.__exit__(None, None, None)
-
+                # tokens: [1, 17, 1] - Channel 0 is text, Channels 1-8 are audio
+                audio_tokens = tokens[:, 1:9, :]  # Extract audio channels
+                
+                # Decode to audio
+                pcm = self.mimi.decode(audio_tokens)
+                if output_audio is None:
+                    output_audio = pcm
+                else:
+                    output_audio = torch.cat([output_audio, pcm], dim=-1)
+            
+            return output_audio
+    
     def reset(self):
-        """Exit and re-enter streaming contexts to clear history."""
-        # logger.info("Resetting Moshi state...")
-        self.close()
+        """Reset streaming state for a new session."""
+        logger.info("Resetting PersonaPlex state...")
+        self.mimi.reset_streaming()
+        self.lm_gen.reset_streaming()
+    
+    def warmup(self):
+        """Warm up the model with dummy data."""
+        logger.info("Warming up PersonaPlex...")
+        for _ in range(4):
+            chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
+            codes = self.mimi.encode(chunk)
+            for c in range(codes.shape[-1]):
+                tokens = self.lm_gen.step(codes[:, :, c:c+1])
+                if tokens is not None:
+                    _ = self.mimi.decode(tokens[:, 1:9])
         
-        self.streaming_ctx = self.mimi.streaming(batch_size=1)
-        self.streaming_ctx.__enter__()
-        
-        self.lm_gen_ctx = self.lm_gen.streaming(batch_size=1)
-        self.lm_gen_ctx.__enter__()
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()
+        logger.info("Warmup complete.")
+    
+    def close(self):
+        """Cleanup resources."""
+        pass  # streaming_forever handles cleanup
+
 
 class PersonaPlexEngine:
+    """
+    Main engine class that handles audio processing.
+    """
+    
     def __init__(self):
         self.is_mock = True
         self.wrapper = None
         self.buffer = np.array([], dtype=np.float32)
 
-        if moshi is None:
-            logger.error("Moshi library not found. Falling back to MOCK engine.")
+        if not MOSHI_AVAILABLE:
+            logger.error("moshi-personaplex not found. Falling back to MOCK engine.")
+            logger.error("Install with: pip install /path/to/personaplex/moshi/.")
             return
 
         try:
-            self.wrapper = MoshiWrapper()
+            self.wrapper = PersonaPlexWrapper(device=DEVICE)
+            self.wrapper.warmup()
             self.is_mock = False
-            logger.info("Real AI Engine Loaded Successfully.")
+            logger.info("PersonaPlex Engine loaded successfully!")
         except Exception as e:
-            logger.error(f"Failed to load real model: {e}", exc_info=True)
+            logger.error(f"Failed to load PersonaPlex: {e}", exc_info=True)
             logger.warning("Falling back to MOCK engine.")
             self.is_mock = True
 
     def configure(self, persona: str, voice_id: str):
-        pass
+        """Configure the persona and voice for the session."""
+        if self.wrapper is not None:
+            # Voice prompt loading would require voice prompt directory
+            # For now, just log the configuration
+            logger.info(f"Configured persona: {persona[:50]}..., voice: {voice_id}")
+            # TODO: Implement voice prompt loading when voice files are available
+            # self.wrapper.load_voice_prompt(voice_id)
 
     def process_audio_frame(self, audio_frame: bytes) -> bytes:
         """
         Process incoming audio bytes and return generated audio bytes.
         """
         if self.is_mock:
-            # Mock behavior: Echo random noise or simple tone
-            # return audio_frame # Echo
+            # Mock: return low-volume noise
             return np.random.uniform(-0.1, 0.1, len(audio_frame) // 4).astype(np.float32).tobytes()
 
-        # Real inference
         try:
             # Convert bytes to float32 numpy
             audio_np = np.frombuffer(audio_frame, dtype=np.float32)
 
-            # VALIDATION: Check for NaNs/Infs and Clamp
+            # Validate input
             if not np.isfinite(audio_np).all():
-                logger.warning("Invalid audio data detected (NaN/Inf). returning silence to avoid model crash.")
+                logger.warning("Invalid audio data (NaN/Inf). Returning silence.")
                 return np.zeros_like(audio_np).tobytes()
             
-            # Auto-Scale Heuristic:
-            # If values significantly exceed 1.0, it's likely Int16 data being treated as Float32.
-            # Normal range of float audio is -1.0 to 1.0. Int16 is -32768 to 32767.
+            # Auto-scale if values look like Int16 misinterpreted as Float32
             max_val = np.abs(audio_np).max()
-            rms_val = np.sqrt(np.mean(audio_np**2))
-            # logger.info(f"Audio Frame RMS: {rms_val:.4f}, Max: {max_val:.4f}")
-
             if max_val > 5.0:
-                 # logger.warning(f"High amplitude detected (max {max_val}). Assuming Int16 mismatch and normalizing.")
-                 audio_np = audio_np / 32768.0
+                audio_np = audio_np / 32768.0
 
-            # Clip to standard audio range [-1, 1] to prevent embedding explosions
+            # Clip to [-1, 1]
             audio_np = np.clip(audio_np, -1.0, 1.0)
             
             # Add to buffer
             self.buffer = np.concatenate((self.buffer, audio_np))
             
-            # Check if we have enough for a frame (1920 samples)
-            # We strictly consume chunks of 1920
-            FRAME_SIZE = 1920
-            
+            # Process frames
+            FRAME_SIZE = self.wrapper.frame_size if self.wrapper else 1920
             output_audio = b""
             
             while len(self.buffer) >= FRAME_SIZE:
                 chunk = self.buffer[:FRAME_SIZE]
                 self.buffer = self.buffer[FRAME_SIZE:]
                 
-                # To Tensor [1, 1, 1920]
-                chunk_tensor = torch.from_numpy(chunk).view(1, 1, -1).to(DEVICE)
+                # Convert to tensor [1, 1, frame_size]
+                chunk_tensor = torch.from_numpy(chunk).view(1, 1, -1).to(
+                    device=self.wrapper.device, 
+                    dtype=torch.float32
+                )
                 
                 out_tensor = self.wrapper.process(chunk_tensor)
                 
                 if out_tensor is not None:
-                    # [1, 1, T] -> cpu numpy
                     out_np = out_tensor.squeeze().cpu().numpy().astype(np.float32)
                     output_audio += out_np.tobytes()
-                else:
-                    # Delay/Silence - send 0s or nothing? 
-                    # If we send nothing, frontend might starve. 
-                    # Use zeros for silence if LM is thinking/buffering.
-                    # Or just return empty and let frontend wait.
-                    pass 
 
             return output_audio
             
         except Exception as e:
             logger.error(f"Error in inference: {e}", exc_info=True)
-            return b"" # Return silence or original on error
-
-    def shutdown(self):
-        if self.wrapper:
-            self.wrapper.close()
+            return b""
 
     def reset(self):
-        """Reset the internal buffer and model state for a new session."""
+        """Reset state for a new session."""
         self.buffer = np.array([], dtype=np.float32)
         if self.wrapper:
             self.wrapper.reset()
+
+    def shutdown(self):
+        """Shutdown the engine."""
+        if self.wrapper:
+            self.wrapper.close()
 
 
 # Global Instance
